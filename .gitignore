@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+logs/
+debug-gamescope-x11.png
+config.json
