@@ -15,15 +15,8 @@ from Xlib import X, display
 HERE = Path(__file__).resolve().parent
 UPSTREAM = HERE / "DiscordRichPresence.py"
 
-# Gamescope uses a nested X server for this WoW launch. These can be overridden
-# if the display/auth path changes later.
-XDISPLAY = os.environ.get("CRAFTPRESENCE_XDISPLAY", ":1")
+DEFAULT_XDISPLAY = ":1"
 DEFAULT_XAUTHORITY = "/run/pressure-vessel/Xauthority"
-XAUTHORITY = os.environ.get("CRAFTPRESENCE_XAUTHORITY", DEFAULT_XAUTHORITY)
-
-os.environ.setdefault("DISPLAY", XDISPLAY)
-if XAUTHORITY and Path(XAUTHORITY).exists():
-    os.environ.setdefault("XAUTHORITY", XAUTHORITY)
 
 if not UPSTREAM.is_file():
     raise SystemExit(
@@ -43,10 +36,129 @@ if spec is None or spec.loader is None:
 cp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cp)
 
+_last_x11_environment: tuple[str, str | None] | None = None
+
+
+def _read_process_environment(pid: int) -> dict[str, str]:
+    """Read a same-user Linux process environment from /proc."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return {}
+
+    result: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        if not entry or b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        result[key.decode(errors="replace")] = value.decode(errors="replace")
+    return result
+
+
+def detect_wow_x11_environment() -> tuple[str | None, str | None]:
+    """Find the most likely WoW/Proton DISPLAY and XAUTHORITY under /proc."""
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return None, None
+
+    candidates: list[tuple[int, str, str | None]] = []
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                errors="replace"
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+
+        if "wow.exe" not in cmdline.casefold():
+            continue
+
+        env = _read_process_environment(int(entry.name))
+        xdisplay = env.get("DISPLAY")
+        if not xdisplay:
+            continue
+        xauthority = env.get("XAUTHORITY")
+
+        try:
+            comm = (entry / "comm").read_text(errors="replace").strip().casefold()
+        except OSError:
+            comm = ""
+
+        score = 0
+        if comm == "wow.exe":
+            score += 10
+        if env.get("STEAM_COMPAT_DATA_PATH"):
+            score += 5
+        if env.get("WINEPREFIX"):
+            score += 4
+        if xauthority:
+            score += 2
+        if xauthority and "pressure-vessel" in xauthority:
+            score += 5
+
+        folded_cmd = cmdline.casefold()
+        if "gamescope" in folded_cmd and "wine" not in folded_cmd:
+            score -= 5
+        if "umu-run" in folded_cmd and "wine" not in folded_cmd:
+            score -= 2
+
+        candidates.append((score, xdisplay, xauthority))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, xdisplay, xauthority = candidates[0]
+    return xdisplay, xauthority
+
+
+def resolve_x11_environment() -> tuple[str, str | None]:
+    """
+    Resolve the Gamescope X11 connection.
+
+    Explicit CRAFTPRESENCE_* variables win. Otherwise, inspect Wow.exe every
+    time so a user service can start before the game/Gamescope exist.
+    """
+    explicit_display = os.environ.get("CRAFTPRESENCE_XDISPLAY")
+    explicit_xauthority = os.environ.get("CRAFTPRESENCE_XAUTHORITY")
+
+    detected_display = None
+    detected_xauthority = None
+    if not explicit_display or not explicit_xauthority:
+        detected_display, detected_xauthority = detect_wow_x11_environment()
+
+    xdisplay = explicit_display or detected_display or DEFAULT_XDISPLAY
+    xauthority = (
+        explicit_xauthority or detected_xauthority or DEFAULT_XAUTHORITY
+    )
+
+    os.environ["DISPLAY"] = xdisplay
+    if xauthority and Path(xauthority).exists():
+        os.environ["XAUTHORITY"] = xauthority
+
+    global _last_x11_environment
+    current = (xdisplay, xauthority)
+    if current != _last_x11_environment and hasattr(cp, "root_logger"):
+        cp.root_logger.info(
+            "Using Gamescope X11 display %s%s",
+            xdisplay,
+            f" with Xauthority {xauthority}" if xauthority else "",
+        )
+        _last_x11_environment = current
+
+    return xdisplay, xauthority
+
 
 def open_display():
-    """Open the Gamescope X11 display using the configured Xauthority."""
-    return display.Display(XDISPLAY)
+    """Open the currently resolved Gamescope X11 display."""
+    xdisplay, _ = resolve_x11_environment()
+    return display.Display(xdisplay)
 
 
 def iter_windows(root):
@@ -108,7 +220,7 @@ def is_running(window_title: str) -> bool:
 
 
 def capture_top_rows(window_title: str, rows: int = 24) -> Image.Image | None:
-    """Capture the top rows of the real WoW X11 window, before Hyprland scaling."""
+    """Capture the top rows of the real WoW X11 window, before compositor scaling."""
     dpy, window = find_x11_window(window_title)
     if dpy is None or window is None:
         return None
@@ -145,12 +257,7 @@ def capture_top_rows(window_title: str, rows: int = 24) -> Image.Image | None:
 
 
 def decode_row(im: Image.Image, y: int, minimum_run: int) -> str:
-    """
-    Collapse each stable framebuffer-color run into one CraftPresence RGB triplet.
-
-    WoW/Gamescope blends the edges of the addon's colored frames. The interior
-    of each frame remains exact, so short transition runs are ignored.
-    """
+    """Collapse stable framebuffer-color runs into CraftPresence RGB triplets."""
     if im.width <= 0 or y < 0 or y >= im.height:
         return ""
 
@@ -168,7 +275,6 @@ def decode_row(im: Image.Image, y: int, minimum_run: int) -> str:
 
     data: list[int] = []
     for rgb, run_length in runs:
-        # Blended frame edges appear as very short runs; stable interiors are longer.
         if run_length < minimum_run:
             continue
 
@@ -176,8 +282,7 @@ def decode_row(im: Image.Image, y: int, minimum_run: int) -> str:
         if rgb == (255, 255, 255):
             break
 
-        # Pure black is an intentional separator inserted when adjacent encoded
-        # RGB triplets would otherwise be identical.
+        # Pure black separates adjacent identical encoded RGB triplets.
         if rgb == (0, 0, 0):
             continue
 
@@ -186,7 +291,12 @@ def decode_row(im: Image.Image, y: int, minimum_run: int) -> str:
     return cp.decode_read_data(data)
 
 
-def payload_is_sane(decoded: str, event_length: int, event_key: str, array_separator_key: str) -> bool:
+def payload_is_sane(
+    decoded: str,
+    event_length: int,
+    event_key: str,
+    array_separator_key: str,
+) -> bool:
     """Reject blended rows that happen to satisfy the delimiter structure."""
     if not cp.verify_read_data(decoded, event_length, event_key, array_separator_key):
         return False
@@ -195,11 +305,10 @@ def payload_is_sane(decoded: str, event_length: int, event_key: str, array_separ
     if len(parts) != event_length:
         return False
 
-    # Discord application/client IDs are decimal integers. A blended row can
-    # preserve the separators while corrupting this field, so this is a very
-    # strong discriminator between a real payload and a false positive.
+    # Discord application/client IDs are decimal snowflakes. Keep this broad
+    # enough for other valid apps while still rejecting blended false positives.
     client_id = parts[0]
-    if not client_id.isdigit() or len(client_id) < 18:
+    if not client_id.isdigit() or not 15 <= len(client_id) <= 25:
         return False
 
     # Reject control characters introduced by sampling a transition row.
@@ -210,18 +319,18 @@ def payload_is_sane(decoded: str, event_length: int, event_key: str, array_separ
     return True
 
 
-def decode_capture(im: Image.Image, event_length: int, event_key: str, array_separator_key: str):
+def decode_capture(
+    im: Image.Image,
+    event_length: int,
+    event_key: str,
+    array_separator_key: str,
+):
     """Try clean interior rows first and return the first sane payload."""
     max_rows = min(im.height, 24)
 
-    # On this WoW/Gamescope path the top edge is antialiased, while rows 4-7
-    # are the stable interior of the 6px CraftPresence frames. Prefer them,
-    # then fall back to every other row if the UI scale changes later.
     preferred = [y for y in (5, 4, 6, 7, 3, 2, 8, 9) if y < max_rows]
     row_order = preferred + [y for y in range(max_rows) if y not in preferred]
 
-    # minimum_run=4 is comfortably inside the stable block on this setup, but
-    # the surrounding values make the helper resilient to small scale changes.
     for minimum_run in (4, 3, 5, 2, 6, 7, 8, 9, 10):
         for y in row_order:
             decoded = decode_row(im, y, minimum_run)
@@ -258,7 +367,9 @@ def read_squares(
                 decoded,
             )
         else:
-            cp.root_logger.error("Captured WoW, but no valid CraftPresence payload was decoded.")
+            cp.root_logger.error(
+                "Captured WoW, but no valid CraftPresence payload was decoded."
+            )
         return None
 
     if not decoded:
@@ -267,8 +378,8 @@ def read_squares(
     return cp.get_decoded_chunks(decoded, event_key, array_separator_key)
 
 
-# Bypass upstream's Linux/Wayland refusal while preserving all current v1.9.0
-# payload parsing and Discord RPC logic.
+# Bypass upstream's Linux/Wayland refusal while preserving its payload parsing
+# and Discord RPC behavior.
 cp.is_windows = False
 cp.is_linux = False
 cp.is_running = is_running
@@ -276,5 +387,7 @@ cp.read_squares = read_squares
 
 cp.config = cp.load_config()
 cp.root_logger = cp.setup_logging(cp.config, cp.config["debug"])
-cp.root_logger.info("Using direct Gamescope X11 capture on %s", XDISPLAY)
+cp.root_logger.info(
+    "Gamescope X11 capture enabled; waiting for %s", cp.config["process_name"]
+)
 cp.main(cp.config["debug"])
