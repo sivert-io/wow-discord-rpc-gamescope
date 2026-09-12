@@ -1,0 +1,66 @@
+name: Compatibility report
+description: Report a working setup or a capture/RPC problem
+title: "[Compatibility] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve compatibility. Please include the environment details below.
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      placeholder: CachyOS / Arch / Fedora / ...
+    validations:
+      required: true
+  - type: input
+    id: compositor
+    attributes:
+      label: Desktop / compositor
+      placeholder: Hyprland, KDE Plasma, GNOME, ...
+    validations:
+      required: true
+  - type: input
+    id: gamescope
+    attributes:
+      label: Gamescope version
+    validations:
+      required: true
+  - type: input
+    id: proton
+    attributes:
+      label: Proton / Wine runner
+      placeholder: GE-Proton 11-6, Proton Experimental, ...
+    validations:
+      required: true
+  - type: input
+    id: wow
+    attributes:
+      label: WoW version and resolution
+      placeholder: 3.3.5a, 3840x2160
+    validations:
+      required: true
+  - type: input
+    id: craftpresence
+    attributes:
+      label: CraftPresence version
+      placeholder: v2.16.4
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Working
+        - Not working
+        - Partially working
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / details
+      description: If using the systemd service, include relevant output from journalctl.
+      render: shell
